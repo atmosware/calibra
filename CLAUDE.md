@@ -43,7 +43,8 @@ Claude Code
     │  1. reads engine flag (heuristic | ml)
     │  2. correctTypos() — hunspell EN/TR typo correction (fail-soft)
     │  3. classifies prompt → tier (light/mid/deep/ultra)
-    │  4. rewrites body.model in-flight
+    │  4. downgrade damping — clamps abrupt tier drops (see below)
+    │  5. rewrites body.model in-flight
     ▼
 Upstream AI server  (CALIBRA_REMOTE_HOST)
 ```
@@ -67,6 +68,23 @@ Real upstream (LiteLLM gateway or api.openai.com), auth forwarded unchanged
 - **ML (opt-in, both Claude and Codex):** `classifyML()` in `src/ml/calibra-ml.js` — MiniLM-L6-v2 ONNX + cosine similarity to tier centroids. Each side reads its own engine flag (`calibra-engine` for Claude via `saka-proxy.js`, `calibra-engine-codex` for Codex via `codex-proxy.js`); both fail soft to the heuristic.
 
 **ML long-prompt handling.** MiniLM's trained max sequence length is 256 tokens. `tokenizeChunks()` in `src/ml/tokenizer.js` covers prompts beyond that by pooling instead of tail-truncating: it splits the full token stream into overlapping 256-token windows (56-token stride) and caps at 4 windows via head+tail sampling (keeps first ⌈N/2⌉ + last ⌊N/2⌋ windows, drops the middle — the task statement is usually up front and constraints/edge-cases at the end). `runInference()` in `calibra-ml.js` embeds each window independently (ONNX + mean-pool + L2-normalize), classifies each (linear classifier or centroid path), and returns the **most severe tier** across windows, tie-broken by score — tiering asks whether any part of the prompt looks deep/ultra, not the average. Multi-window runs are tagged with a `+chunked` suffix on `reason` (e.g. `ml-classifier+chunked`) so this is visible in `/calibra status`/logs. Prompts that already fit in 256 tokens produce exactly one window and are unaffected — no behavior or cost change for the common case. `tokenize()` (single-window, tail-truncating) is kept for the training tools (`tools/compute_centroids.js`, `tools/train_tier_classifier.js`), which run over short labeled prompts.
+
+**Downgrade damping (tier hysteresis).** After classification, both proxies clamp
+*downgrades* via `applyDamp()` in `src/ml/downgrade-damper.js`, between the tier
+decision and the tier→model map. Because each prompt is classified independently, a
+sequence like `ultra` then `light` would otherwise snap the model from the heaviest
+tier to the cheapest in one step. `applyDamp` limits a new prompt to at most **one
+tier below the conversation's previous effective tier**, floored at `mid` (a damped
+drop never reaches `light` — `light` is only routed when the previous tier was
+already `light`). **Upgrades are never touched** — a prompt classified higher routes
+higher immediately. State is a per-conversation store (`calibra-last-tier.json`, keyed
+by a hash of the first user message via `keyFrom()`) with a TTL (`CALIBRA_DAMP_TTL_MS`,
+default 30 min) so parallel sessions don't clobber and stale threads don't damp. The
+**effective (damped)** tier is persisted as the new prev, so a run of cheap prompts
+walks down one tier per turn (`ultra→deep→mid→mid`) rather than snapping back. When a
+drop is damped, `+damped(prev->eff)` is appended to `reason` for `/calibra status`,
+the notify hook, and stderr. Fully fail-soft (missing module / any fs error → raw
+tier) and disableable via `CALIBRA_DAMP_DISABLED=1`.
 
 Both engines receive typo-corrected text via `correctTypos()` (from `spellcorrect.js`) before scoring. This is fail-soft: missing dictionaries → correction silently no-ops; missing ONNX model / timeout → ML falls back to heuristic.
 
@@ -97,8 +115,10 @@ The enterprise wrapper expects the proxy at `~/.claude-corp/saka-proxy.js`. Cali
     calibra-engine-codex    ← flag file: 'ml' or 'heuristic' for Codex (absent=heuristic)
     calibra-engine          ← flag file: 'ml' or 'heuristic' (absent=heuristic)
     calibra-proxy-host      ← upstream hostname
+    calibra-last-tier.json  ← downgrade-damping store: {convKey→{tier,ts}} (TTL-pruned)
     ml/
       calibra-ml.js         ← ML classifier
+      downgrade-damper.js   ← tier hysteresis (clamp downgrades, floor mid)
       classify-core.js      ← shared fast-exits + re-exports correctTypos
       engine-flag.js        ← readEngine/writeEngine
       spellcorrect.js       ← EN/TR hunspell typo correction (fail-soft)
@@ -120,6 +140,7 @@ The enterprise wrapper expects the proxy at `~/.claude-corp/saka-proxy.js`. Cali
 | `src/codex-proxy.js` | Codex-side proxy server (OpenAI Responses API), always-on fixed-port service |
 | `src/ml/classify-core.js` | Shared fast-exits, regex constants, `calibraClassify()`, `extractPrompt()`/`extractPromptOpenAI()`, re-exports `correctTypos` |
 | `src/ml/calibra-ml.js` | ML engine: ONNX session, chunked-window embedding + pooling, cosine similarity, LRU cache, warmup |
+| `src/ml/downgrade-damper.js` | Downgrade damping: pure `damp()` clamp + per-conversation `applyDamp()` store (TTL, atomic writes), `keyFrom()` |
 | `src/ml/spellcorrect.js` | Typo correction: nspell + dictionary-en/en-gb/tr, Damerau-Levenshtein, fail-soft |
 | `src/ml/tokenizer.js` | BERT WordPiece tokenizer (reads vocab.txt); `tokenize()` single-window truncating (training tools), `tokenizeChunks()` overlapping-window split for long-prompt inference |
 | `src/ml/tier-centroids.json` | Baked-in tier centroids (~10 KB) |
@@ -158,6 +179,11 @@ The enterprise wrapper expects the proxy at `~/.claude-corp/saka-proxy.js`. Cali
 - `runInference()` never raises `maxLength` past 256 — that's MiniLM's own trained max sequence length, not a config knob. Long prompts are handled by chunking into multiple ≤256-token windows (`tokenizeChunks()`), never by a single oversized window
 - Chunked inference picks the **most severe tier** across windows (tie-break: higher score) — never an average/mean-pooled decision across windows — since tiering asks whether any part of the prompt is deep/ultra
 - Training tools (`compute_centroids.js`, `train_tier_classifier.js`) use `tokenize()` (single-window), not `tokenizeChunks()` — labeled eval prompts are short and centroids/classifiers are fit on single embeddings, so chunking there would change the training distribution
+- Downgrade damping (`downgrade-damper.js`) only ever **raises** a downgraded tier back up — it never lowers a tier and never blocks or delays an **upgrade** (`damp()` returns the raw tier unchanged when `new ≥ prev`)
+- The damping floor is **mid** — a damped downgrade never routes `light`; `light` is only reached when the previous effective tier was already `light`
+- The damping store persists the **effective (damped)** tier as the new prev, never the raw classified tier — else the one-tier-per-turn descent collapses back to a single big drop
+- `downgrade-damper.js` is **fail-soft** like the ML path: a missing module or any fs/JSON error routes the raw undamped tier — routing must never hard-fail on damping. `CALIBRA_DAMP_DISABLED=1` bypasses it entirely
+- The damping store uses atomic tmp+rename writes (same invariant as `engine-flag.js`) and is keyed per-conversation with a TTL — never a single global last-tier value (parallel Claude/Codex sessions would clobber)
 
 ## Improving ML Accuracy
 

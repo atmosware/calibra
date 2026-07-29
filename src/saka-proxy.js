@@ -33,6 +33,20 @@ function loadCalibraModels() {
   }
 }
 
+// First user message text — a stable per-conversation key for downgrade damping
+// (the opening prompt doesn't change across turns, so it fingerprints the thread).
+function calibraConversationHead(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (const msg of messages) {
+    if (!msg || msg.role !== 'user') continue;
+    if (typeof msg.content === 'string') return msg.content;
+    if (Array.isArray(msg.content)) {
+      return msg.content.filter(b => b && b.type === 'text').map(b => b.text).join('\n');
+    }
+  }
+  return '';
+}
+
 async function calibraRoute(parsedBody) {
   if (process.env.CALIBRA_DISABLED === '1') return null;
   if (fs.existsSync(CALIBRA_DISABLED_PATH)) return null;
@@ -68,8 +82,24 @@ async function calibraRoute(parsedBody) {
     result = calibraClassify(prompt);
   }
 
-  const { tier, score, reason } = result;
-  const routed = calibraModels[tier];
+  const { tier, score } = result;
+  let { reason } = result;
+
+  // Downgrade damping: a new prompt may drop at most one tier below this
+  // conversation's previous effective tier (floor: mid). Upgrades untouched.
+  // Fail-soft — any error routes the raw tier.
+  let effTier = tier;
+  if (!process.env.CALIBRA_DAMP_DISABLED) {
+    try {
+      const { applyDamp, keyFrom } = requireCalibraMl('downgrade-damper.js');
+      const head = calibraConversationHead(parsedBody.messages);
+      const d = applyDamp(tier, keyFrom(head), Date.now());
+      effTier = d.tier;
+      if (d.damped) reason = `${reason}+damped(${d.prevTier}->${effTier})`;
+    } catch { /* module missing / error — keep raw tier */ }
+  }
+
+  const routed = calibraModels[effTier];
   if (!routed) return null;
 
   // Normalize current model: strip variant suffixes like [1m], [2m]
@@ -77,7 +107,7 @@ async function calibraRoute(parsedBody) {
   if (routed === currentModel) return null;
 
   // Write switch info to temp file for Stop hook to display
-  const switchInfo = { currentModel, routed, tier, score, reason, engine: result.engine || engine, timestamp: Date.now() };
+  const switchInfo = { currentModel, routed, tier: effTier, score, reason, engine: result.engine || engine, timestamp: Date.now() };
   const infoPath = path.join(require('os').tmpdir(), '.calibra-switch.json');
   try {
     fs.writeFileSync(infoPath, JSON.stringify(switchInfo));

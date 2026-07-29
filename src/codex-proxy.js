@@ -54,6 +54,24 @@ function loadOpenAiModels() {
 // async because the ML engine (classifyML) is async; the heuristic path resolves
 // synchronously. Reads the per-env Codex engine flag each request (cheap fs read;
 // the flag may flip mid-session via `calibra ml on|off`).
+// First user message text — stable per-conversation key for downgrade damping.
+function calibraConversationHeadOpenAI(body) {
+  if (!body) return '';
+  const input = body.input;
+  if (typeof input === 'string') return input;
+  if (!Array.isArray(input)) return '';
+  for (const item of input) {
+    if (!item || item.role !== 'user') continue;
+    if (typeof item.content === 'string') return item.content;
+    if (Array.isArray(item.content)) {
+      return item.content
+        .filter(b => b && (b.type === 'input_text' || b.type === 'text') && typeof b.text === 'string')
+        .map(b => b.text).join('\n');
+    }
+  }
+  return '';
+}
+
 async function calibraRouteOpenAI(parsedBody) {
   if (process.env.CALIBRA_DISABLED === '1') return null;
   if (fs.existsSync(CALIBRA_DISABLED_PATH)) return null;
@@ -84,16 +102,31 @@ async function calibraRouteOpenAI(parsedBody) {
     result = calibraClassify(prompt);
   }
 
-  const { tier, reason } = result;
+  const { tier } = result;
+  let { reason } = result;
   const engine = result.engine || 'heuristic';
-  const routed = models[tier];
+
+  // Downgrade damping — one tier below the previous effective tier max, floor
+  // mid, upgrades untouched. Shared with the Claude side; fail-soft.
+  let effTier = tier;
+  if (!process.env.CALIBRA_DAMP_DISABLED) {
+    try {
+      const { applyDamp, keyFrom } = requireCalibraMl('downgrade-damper.js');
+      const head = calibraConversationHeadOpenAI(parsedBody);
+      const d = applyDamp(tier, keyFrom(head), Date.now());
+      effTier = d.tier;
+      if (d.damped) reason = `${reason}+damped(${d.prevTier}->${effTier})`;
+    } catch { /* module missing / error — keep raw tier */ }
+  }
+
+  const routed = models[effTier];
   if (!routed) return null;
 
   const currentModel = parsedBody.model || '';
   if (routed === currentModel) return null;
 
-  process.stderr.write(`[calibra-codex] routing to ${routed} (tier: ${tier}, engine: ${engine}, reason: ${reason})\n`);
-  return { model: routed, tier, reason, engine };
+  process.stderr.write(`[calibra-codex] routing to ${routed} (tier: ${effTier}, engine: ${engine}, reason: ${reason})\n`);
+  return { model: routed, tier: effTier, reason, engine };
 }
 
 // --- Calibra: /calibra on|off|status|toggle for Codex ------------------------
