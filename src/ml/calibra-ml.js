@@ -15,7 +15,7 @@ const {
   correctTypos,
 } = require('./classify-core.js');
 
-const { tokenize } = require('./tokenizer.js');
+const { tokenizeChunks } = require('./tokenizer.js');
 const { classifyEmbedding } = require('./linear-classifier.js');
 
 function heuristicFallback(prompt, cause) {
@@ -117,6 +117,8 @@ function findBestTier(embedding, centroids) {
   return { tier: bestTier, score: bestSim };
 }
 
+const TIER_SEVERITY = { light: 0, mid: 1, deep: 2, ultra: 3 };
+
 // ── ONNX session singleton ────────────────────────────────────────────────────
 
 let _session     = null;
@@ -188,6 +190,29 @@ function cacheSet(k, v) {
 
 // ── Core inference ────────────────────────────────────────────────────────────
 
+async function embedChunk(session, ort, chunk, hiddenSize) {
+  const seqLen = chunk.input_ids.length;
+
+  function toInt64Tensor(arr) {
+    return new ort.Tensor('int64', BigInt64Array.from(arr, v => BigInt(v)), [1, arr.length]);
+  }
+
+  const feeds = {
+    input_ids:      toInt64Tensor(chunk.input_ids),
+    attention_mask: toInt64Tensor(chunk.attention_mask),
+    token_type_ids: toInt64Tensor(chunk.token_type_ids),
+  };
+
+  const results = await session.run(feeds);
+
+  // all-MiniLM-L6-v2 outputs last_hidden_state [1, seq, 384]
+  const hiddenData = results['last_hidden_state']?.data ||
+                     results[session.outputNames[0]].data;
+
+  const pooled = meanPool(hiddenData, chunk.attention_mask, seqLen, hiddenSize);
+  return l2Normalize(pooled);
+}
+
 async function runInference(trimmed) {
   const session = await getSession();
   if (!session) throw new Error('no-session');
@@ -197,44 +222,43 @@ async function runInference(trimmed) {
   const maxLen     = config.maxLength  || 256;
   const hiddenSize = parseInt(process.env.CALIBRA_ML_HIDDEN, 10) || config.hiddenSize || 384;
 
-  const { input_ids, attention_mask, token_type_ids } = tokenize(trimmed, maxLen);
-  const seqLen = input_ids.length;
-
-  function toInt64Tensor(arr) {
-    return new ort.Tensor('int64', BigInt64Array.from(arr, v => BigInt(v)), [1, arr.length]);
-  }
-
-  const feeds = {
-    input_ids:      toInt64Tensor(input_ids),
-    attention_mask: toInt64Tensor(attention_mask),
-    token_type_ids: toInt64Tensor(token_type_ids),
-  };
-
-  const results = await session.run(feeds);
-
-  // all-MiniLM-L6-v2 outputs last_hidden_state [1, seq, 384]
-  const hiddenData = results['last_hidden_state']?.data ||
-                     results[session.outputNames[0]].data;
-
-  const pooled     = meanPool(hiddenData, attention_mask, seqLen, hiddenSize);
-  const normalized = l2Normalize(pooled);
+  // Long prompts get pooled across overlapping windows instead of tail-truncated
+  // to maxLen — MiniLM's own trained max sequence length is 256, so this stays
+  // within that per inference call rather than raising it.
+  const chunks = tokenizeChunks(trimmed, maxLen);
 
   const classifier = loadClassifier();
+  const centroids  = classifier ? null : loadCentroids();
+  if (!classifier && !centroids) throw new Error('centroids not found');
+
+  const chunkResults = await Promise.all(chunks.map(async (chunk) => {
+    const normalized = await embedChunk(session, ort, chunk, hiddenSize);
+    if (classifier) {
+      const r = classifyEmbedding(normalized, classifier, trimmed);
+      return { severity: TIER_SEVERITY[r.tier] ?? 0, r };
+    }
+    const { tier, score } = findBestTier(normalized, centroids);
+    return { severity: TIER_SEVERITY[tier] ?? 0, r: { tier, score } };
+  }));
+
+  // Most severe chunk wins — tiering asks "does ANY part of this prompt look
+  // deep/ultra," not the average tone across the whole thing.
+  chunkResults.sort((a, b) => b.severity - a.severity || b.r.score - a.r.score);
+  const best = chunkResults[0].r;
+  const chunkedSuffix = chunks.length > 1 ? '+chunked' : '';
+
   if (classifier) {
-    const r = classifyEmbedding(normalized, classifier, trimmed);
-    const guarded = applyRoutingGuards(trimmed, r.tier);
-    const reason = guarded !== r.tier ? 'ml-classifier+guard'
-      : (r.rawTier && r.rawTier !== r.tier ? 'ml-classifier+risk-policy' : 'ml-classifier');
+    const guarded = applyRoutingGuards(trimmed, best.tier);
+    const reason = guarded !== best.tier ? 'ml-classifier+guard'
+      : (best.rawTier && best.rawTier !== best.tier ? 'ml-classifier+risk-policy' : 'ml-classifier');
     return {
-      tier: guarded, rawTier: r.rawTier, score: r.score, rawScore: r.rawScore,
-      margin: r.margin, decision: r.decision, ordinal: r.ordinal, reason, engine: 'ml',
+      tier: guarded, rawTier: best.rawTier, score: best.score, rawScore: best.rawScore,
+      margin: best.margin, decision: best.decision, ordinal: best.ordinal,
+      reason: reason + chunkedSuffix, engine: 'ml',
     };
   }
 
-  const centroids  = loadCentroids();
-  if (!centroids) throw new Error('centroids not found');
-  const { tier, score } = findBestTier(normalized, centroids);
-  return { tier, score, reason: 'ml-centroid', engine: 'ml' };
+  return { tier: best.tier, score: best.score, reason: 'ml-centroid' + chunkedSuffix, engine: 'ml' };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

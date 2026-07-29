@@ -107,6 +107,7 @@ const SEP_TOKEN = '[SEP]';
  * Tokenize `text` for BERT / all-MiniLM-L6-v2 inference.
  * Returns { input_ids, attention_mask, token_type_ids } as Int32Arrays.
  * Falls back to [CLS][UNK][SEP] if vocab is unavailable.
+ * Tail-truncates at maxLength — use tokenizeChunks() for long-prompt inference.
  *
  * @param {string} text
  * @param {number} [maxLength=256]
@@ -124,24 +125,26 @@ function tokenize(text, maxLength = 256) {
 
   const clsId = vocab.get(CLS_TOKEN) ?? 101;
   const sepId = vocab.get(SEP_TOKEN) ?? 102;
-  const unkId = vocab.get(UNK_TOKEN) ?? 100;
-
-  const words   = basicTokenize(text || '');
-  const ids     = [];
   const maxBody = maxLength - 2;
+  const ids = encodeWords(text, vocab).slice(0, maxBody);
 
-  outer:
+  return wrapChunk(ids, clsId, sepId);
+}
+
+function encodeWords(text, vocab) {
+  const unkId = vocab.get(UNK_TOKEN) ?? 100;
+  const words = basicTokenize(text || '');
+  const ids   = [];
   for (const word of words) {
     const subs = wordpieceTokenize(word, vocab);
-    for (const sw of subs) {
-      if (ids.length >= maxBody) break outer;
-      ids.push(vocab.get(sw) ?? unkId);
-    }
+    for (const sw of subs) ids.push(vocab.get(sw) ?? unkId);
   }
+  return ids;
+}
 
-  const full = [clsId, ...ids, sepId];
+function wrapChunk(bodyIds, clsId, sepId) {
+  const full = [clsId, ...bodyIds, sepId];
   const len  = full.length;
-
   return {
     input_ids:      new Int32Array(full),
     attention_mask: new Int32Array(len).fill(1),
@@ -149,4 +152,55 @@ function tokenize(text, maxLength = 256) {
   };
 }
 
-module.exports = { tokenize, loadVocab, VOCAB_PATH };
+/**
+ * Split `text` into overlapping windows of up to `maxLength` tokens each, so a
+ * long prompt gets pooled across chunks instead of silently tail-truncated
+ * (MiniLM's own trained max sequence length is 256 — this works within that,
+ * not around it). When the prompt overflows `maxChunks` windows, keeps the
+ * head and tail windows and drops the middle: the task is usually stated up
+ * front and constraints/edge-cases at the end, with elaboration in between.
+ *
+ * @param {string} text
+ * @param {number} [maxLength=256]
+ * @param {{stride?: number, maxChunks?: number}} [opts]
+ * @returns {Array<{input_ids: Int32Array, attention_mask: Int32Array, token_type_ids: Int32Array}>}
+ */
+function tokenizeChunks(text, maxLength = 256, opts = {}) {
+  const stride    = opts.stride ?? 56;
+  const maxChunks = opts.maxChunks ?? 4;
+
+  const vocab = loadVocab();
+  if (!vocab) {
+    return [{
+      input_ids:      new Int32Array([101, 100, 102]),
+      attention_mask: new Int32Array([1,   1,   1  ]),
+      token_type_ids: new Int32Array([0,   0,   0  ]),
+    }];
+  }
+
+  const clsId   = vocab.get(CLS_TOKEN) ?? 101;
+  const sepId   = vocab.get(SEP_TOKEN) ?? 102;
+  const maxBody = maxLength - 2;
+
+  const ids = encodeWords(text, vocab);
+  if (ids.length <= maxBody) return [wrapChunk(ids, clsId, sepId)];
+
+  const step = Math.max(1, maxBody - stride);
+  const windows = [];
+  for (let start = 0; start < ids.length; start += step) {
+    const end = Math.min(start + maxBody, ids.length);
+    windows.push(ids.slice(start, end));
+    if (end >= ids.length) break;
+  }
+
+  let picked = windows;
+  if (windows.length > maxChunks) {
+    const head = Math.ceil(maxChunks / 2);
+    const tail = maxChunks - head;
+    picked = [...windows.slice(0, head), ...windows.slice(windows.length - tail)];
+  }
+
+  return picked.map(w => wrapChunk(w, clsId, sepId));
+}
+
+module.exports = { tokenize, tokenizeChunks, loadVocab, VOCAB_PATH };

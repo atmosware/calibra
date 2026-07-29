@@ -66,6 +66,8 @@ Real upstream (LiteLLM gateway or api.openai.com), auth forwarded unchanged
 - **Heuristic (default):** `calibraClassify()` in `src/ml/classify-core.js` — 5-axis regex scoring, shared by both `saka-proxy.js` and `codex-proxy.js`
 - **ML (opt-in, both Claude and Codex):** `classifyML()` in `src/ml/calibra-ml.js` — MiniLM-L6-v2 ONNX + cosine similarity to tier centroids. Each side reads its own engine flag (`calibra-engine` for Claude via `saka-proxy.js`, `calibra-engine-codex` for Codex via `codex-proxy.js`); both fail soft to the heuristic.
 
+**ML long-prompt handling.** MiniLM's trained max sequence length is 256 tokens. `tokenizeChunks()` in `src/ml/tokenizer.js` covers prompts beyond that by pooling instead of tail-truncating: it splits the full token stream into overlapping 256-token windows (56-token stride) and caps at 4 windows via head+tail sampling (keeps first ⌈N/2⌉ + last ⌊N/2⌋ windows, drops the middle — the task statement is usually up front and constraints/edge-cases at the end). `runInference()` in `calibra-ml.js` embeds each window independently (ONNX + mean-pool + L2-normalize), classifies each (linear classifier or centroid path), and returns the **most severe tier** across windows, tie-broken by score — tiering asks whether any part of the prompt looks deep/ultra, not the average. Multi-window runs are tagged with a `+chunked` suffix on `reason` (e.g. `ml-classifier+chunked`) so this is visible in `/calibra status`/logs. Prompts that already fit in 256 tokens produce exactly one window and are unaffected — no behavior or cost change for the common case. `tokenize()` (single-window, tail-truncating) is kept for the training tools (`tools/compute_centroids.js`, `tools/train_tier_classifier.js`), which run over short labeled prompts.
+
 Both engines receive typo-corrected text via `correctTypos()` (from `spellcorrect.js`) before scoring. This is fail-soft: missing dictionaries → correction silently no-ops; missing ONNX model / timeout → ML falls back to heuristic.
 
 **Codex/OpenAI support:** `install.js` detects `~/.codex/config.toml` (personal) and `~/.codex-corp/codex-config/config.toml` (corp) and, for each present, backs up the original file (`config.toml.calibra-backup`), sets `model_provider = "calibra"`, and adds a `[model_providers.calibra]` block pointing `base_url` at a fixed local port — preserving the original provider's `base_url`/`wire_api` as the proxy's real upstream (`~/.claude-corp/calibra/codex-proxy-<personal|corp>.json`, containing `port` + `upstreamHost` + `upstreamPort`). Since `codex-proxy.js` must always be running (static `base_url`, no per-session fallback like the Claude wrapper has), install.js registers a platform-native autostart entry: macOS LaunchAgent (`RunAtLoad` + `KeepAlive`), Windows Registry `Run` key via a hidden `.vbs` launcher. `uninstall.js` reverses all of this — restores `config.toml` from backup, unloads/removes the autostart entry, deletes the proxy config/origin/port files.
@@ -117,9 +119,9 @@ The enterprise wrapper expects the proxy at `~/.claude-corp/saka-proxy.js`. Cali
 | `src/saka-proxy.js` | Claude-side proxy server (Anthropic Messages API) |
 | `src/codex-proxy.js` | Codex-side proxy server (OpenAI Responses API), always-on fixed-port service |
 | `src/ml/classify-core.js` | Shared fast-exits, regex constants, `calibraClassify()`, `extractPrompt()`/`extractPromptOpenAI()`, re-exports `correctTypos` |
-| `src/ml/calibra-ml.js` | ML engine: ONNX session, cosine similarity, LRU cache, warmup |
+| `src/ml/calibra-ml.js` | ML engine: ONNX session, chunked-window embedding + pooling, cosine similarity, LRU cache, warmup |
 | `src/ml/spellcorrect.js` | Typo correction: nspell + dictionary-en/en-gb/tr, Damerau-Levenshtein, fail-soft |
-| `src/ml/tokenizer.js` | BERT WordPiece tokenizer (reads vocab.txt) |
+| `src/ml/tokenizer.js` | BERT WordPiece tokenizer (reads vocab.txt); `tokenize()` single-window truncating (training tools), `tokenizeChunks()` overlapping-window split for long-prompt inference |
 | `src/ml/tier-centroids.json` | Baked-in tier centroids (~10 KB) |
 | `src/ml/vocab.txt` | bert-base-uncased vocabulary (bundled) |
 | `src/calibra-ml.json` | ML metadata: model URL, SHA-256, hiddenSize, maxLength |
@@ -153,6 +155,9 @@ The enterprise wrapper expects the proxy at `~/.claude-corp/saka-proxy.js`. Cali
 - `engine-flag.js` `readEngine(flagPath?)`/`writeEngine(value, flagPath?)` default to the Claude flag (`ENGINE_FLAG_PATH`); Codex passes `ENGINE_FLAG_PATH_CODEX` explicitly — never hardcode a second path
 - `calibraRouteOpenAI()` in `codex-proxy.js` is **async** (ML is async); the request handler must `await` it before forwarding
 - `codex-proxy.js` runs on a **fixed** port, unlike `saka-proxy.js` (fresh port per session) — Codex's `config.toml` has a static `base_url`, so the proxy must always be running (autostart, not per-session spawn)
+- `runInference()` never raises `maxLength` past 256 — that's MiniLM's own trained max sequence length, not a config knob. Long prompts are handled by chunking into multiple ≤256-token windows (`tokenizeChunks()`), never by a single oversized window
+- Chunked inference picks the **most severe tier** across windows (tie-break: higher score) — never an average/mean-pooled decision across windows — since tiering asks whether any part of the prompt is deep/ultra
+- Training tools (`compute_centroids.js`, `train_tier_classifier.js`) use `tokenize()` (single-window), not `tokenizeChunks()` — labeled eval prompts are short and centroids/classifiers are fit on single embeddings, so chunking there would change the training distribution
 
 ## Improving ML Accuracy
 

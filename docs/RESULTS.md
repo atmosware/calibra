@@ -11,7 +11,11 @@ were added. Env: `CALIBRA_ML_MODEL_PATH=…/router.onnx`, `CALIBRA_ML_TIMEOUT_MS
 prompt → ruleClassify (rules 1–4, deterministic) ──confident──► RETURN
                   │ confident:false (rules 5–7 + residual)
                   ▼
-          MiniLM ordinal head → expectedCostDecision(policy I) ► RETURN
+          tokenizeChunks (≤256 tok/window, overlapping, head+tail capped at 4)
+                  ▼
+          MiniLM ordinal head per window → expectedCostDecision(policy I) per window
+                  ▼
+          most-severe-tier-wins across windows ► RETURN
 ```
 
 - **Rules 1–4 commit** (greeting, trivial/single-edit, **scope/enum/named-subsystem → ultra**).
@@ -40,7 +44,7 @@ Cost policy I (`tier-classifier.json.decisionPolicy.costs`, actual→pred):
 | Export format | ONNX int8 dynamic quantization (pre-exported by Xenova) |
 | Opset | 17 |
 | Size | ~22 MB (quantized) |
-| Max sequence length | 256 |
+| Max sequence length | 256 (per window; prompts longer than this are chunked into overlapping windows, not truncated — see "Long-prompt chunking" below) |
 | SHA-256 | `afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1` |
 | Model version | 1.0.0 |
 
@@ -342,3 +346,18 @@ node tools/relabel_by_rubric.js tools/{final_holdout_opus_500,calibra_eval_set,a
 node tools/evaluate_classifier.js tools/calibra_eval_set.jsonl --top 0
 node tools/evaluate_classifier.js tools/calibra_eval_set_rubric.jsonl --top 0
 ```
+
+## Long-prompt chunking (no retrain)
+
+**Problem:** MiniLM's trained max sequence length is 256 tokens. `tokenize()` tail-truncated anything longer — a prompt beyond ~180 English words silently lost its back half before embedding, biasing the tier decision toward whatever the front half happened to say.
+
+**Fix (no retrain, no feature-vector change):** `tokenizeChunks()` (`src/ml/tokenizer.js`) splits the token stream into overlapping 256-token windows (56-token stride), capped at 4 windows via head+tail sampling when a prompt overflows that (drops the middle, keeps the windows most likely to carry the task statement and the constraints/edge-cases). `runInference()` (`src/ml/calibra-ml.js`) embeds and classifies each window independently through the existing ordinal head + `expectedCostDecision`, then takes the **most severe tier across windows** (tie-break: higher score) as the final decision — tiering asks whether any part of the prompt looks deep/ultra, not the average. `reason` gets a `+chunked` suffix when more than one window ran, so it's visible in logs/`/calibra status`. A prompt that already fits in 256 tokens produces exactly one window and takes the exact same path as before (byte-identical decision, no cost change) — the fix only changes behavior for the previously-truncated tail.
+
+**Regression check (before/after via `git stash`, same classifier, same eval harness):**
+
+| set | rows | accuracy (before) | accuracy (after) | routingCost (before) | routingCost (after) | mistakeCount (before) | mistakeCount (after) |
+|-----|-----:|---:|---:|---:|---:|---:|---:|
+| holdout_opus4-8_v3 | 400 | 0.8600 | 0.8600 | 0.3875 | 0.3875 | 56 | 56 |
+| final_holdout_opus_500 | 500 | 0.9420 | 0.9420 | 0.1360 | 0.1360 | 29 | 29 |
+
+Identical on both sets — none of the existing eval/holdout prompts exceed 256 tokens, so the chunked path stays dormant on current data and the single-window path is unchanged. `node src/ml/classify-core.test.js` also unaffected (47/47; heuristic engine, untouched by this change). No regression to guard against beyond this until an eval set with genuinely long (>256-token) prompts exists to exercise the new path directly.

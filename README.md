@@ -106,12 +106,12 @@ The ML engine uses a **rule-first cascade**: deterministic rules handle the clea
 2. **Typo correction (`correctTypos`)** — same EN/TR hunspell correction as the heuristic engine, applied before the rule layer. The ONNX embedding also receives corrected text, so a typo variant and its correct form produce the same (or very close) sentence vector.
 
 3. **MiniLM ONNX pipeline** (rules 5–7 residual only):
-   1. Tokenize prompt with BERT WordPiece (`bert-base-uncased`)
-   2. Run `all-MiniLM-L6-v2` ONNX → `last_hidden_state` [1 × seq × 384]
-   3. Mean-pool with attention mask → sentence vector [384]; L2-normalize
-   4. Append lexical feature axes: `deepC`, `midC`, `scopeC`, `domainC`
-   5. Ordinal regression head → tier posterior distribution [light, mid, deep, ultra]
-   6. `expectedCostDecision(policy I)` — choose the tier minimising **expected routing cost** over the posterior, not raw argmax. The cost matrix biases the ambiguous boundary toward the safer tier (never severely under-route).
+   1. Tokenize prompt with BERT WordPiece (`bert-base-uncased`). MiniLM's trained max sequence length is 256 tokens, so a longer prompt is split into overlapping 256-token windows (56-token stride) instead of tail-truncated — up to 4 windows, keeping the head + tail windows and dropping the middle if there are more (task statement is usually up front, constraints/edge-cases at the end).
+   2. Run `all-MiniLM-L6-v2` ONNX on each window → `last_hidden_state` [1 × seq × 384]
+   3. Mean-pool with attention mask → sentence vector [384] per window; L2-normalize
+   4. Append lexical feature axes (`deepC`, `midC`, `scopeC`, `domainC`) and classify each window independently
+   5. Ordinal regression head → tier posterior distribution [light, mid, deep, ultra], per window
+   6. `expectedCostDecision(policy I)` — choose the tier minimising **expected routing cost** over the posterior, not raw argmax, per window. The cost matrix biases the ambiguous boundary toward the safer tier (never severely under-route). Across windows, the **most severe tier wins** (tie-break: higher score) — a prompt is as complex as its hardest part, not its average. A single window (the common case) skips straight to that window's decision.
 
 4. **Fail-soft** — if the ONNX model is absent, times out (`CALIBRA_ML_TIMEOUT_MS`), or throws, the system silently falls back to the heuristic engine. No error is shown to the user.
 
